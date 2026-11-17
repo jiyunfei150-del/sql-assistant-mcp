@@ -128,9 +128,9 @@ ol.take li{margin:8px 0}
 <p class="sub">模型看不到 MCP，只看到会话层整理过的工具清单；平台看不到模型，只收到服务端补好身份的请求。</p>
 <div class="arch">
   <div class="node">
-    <h4>模型</h4>
+    <h4>模型（GLM）</h4>
     <ul>
-      <li>收到 OpenAI / Anthropic 两种格式的工具声明</li>
+      <li>收到 function calling 格式的工具声明（OpenAI 兼容接口）</li>
       <li>只决定调哪个工具、传什么业务参数</li>
       <li>最后必须调 <code>submit_answer</code> 交卷</li>
     </ul>
