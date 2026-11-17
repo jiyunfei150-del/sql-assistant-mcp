@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQL 助手 MCP 经验</title>
+<style>
+:root{
+  --bg:#f7f6f2; --card:#ffffff; --ink:#1f1e1c; --muted:#6b6862; --line:#e4e1d9;
+  --accent:#2f6fd6; --accent-soft:#e8f0fc; --warn:#b5651d; --warn-soft:#fbf0e4; --code:#f1efe9;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#1a1a19; --card:#232321; --ink:#ecebe7; --muted:#a29f98; --line:#3a3936;
+    --accent:#7aa7ef; --accent-soft:#22314a; --warn:#e3a464; --warn-soft:#3a2c1e; --code:#2d2c29;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#1a1a19; --card:#232321; --ink:#ecebe7; --muted:#a29f98; --line:#3a3936;
+  --accent:#7aa7ef; --accent-soft:#22314a; --warn:#e3a464; --warn-soft:#3a2c1e; --code:#2d2c29;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.7 -apple-system,"PingFang SC","Microsoft YaHei","Segoe UI",sans-serif}
+main{max-width:880px;margin:0 auto;padding:40px 16px 64px}
+h1{font-size:26px;margin:0 0 6px}
+.meta{color:var(--muted);font-size:13px;margin-bottom:28px}
+h2{font-size:19px;margin:40px 0 12px;padding-top:8px;border-top:1px solid var(--line)}
+p{margin:8px 0}
+code{background:var(--code);padding:1px 5px;border-radius:4px;font:13px/1.5 Consolas,Menlo,monospace}
+.lead{background:var(--accent-soft);border-left:4px solid var(--accent);padding:14px 18px;border-radius:8px;font-size:16px}
+.flow{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:16px 0}
+.step{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;position:relative}
+.step b{display:block;font-size:14px;margin-bottom:4px}
+.step span{color:var(--muted);font-size:13px;line-height:1.55;display:block}
+.step .n{position:absolute;top:10px;right:12px;color:var(--accent);font-weight:700;font-size:13px}
+.step.key{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
+.cards{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.card h3{font-size:15px;margin:0 0 6px}
+.card p{font-size:14px;margin:4px 0;color:var(--ink)}
+.card .why{color:var(--muted);font-size:13px}
+table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden;font-size:14px}
+th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{background:var(--code);font-weight:600;font-size:13px}
+tr:last-child td{border-bottom:none}
+.pit{background:var(--warn-soft);color:var(--warn);font-size:12px;padding:1px 7px;border-radius:10px;white-space:nowrap}
+ol.take{padding-left:20px}
+ol.take li{margin:6px 0}
+.tablewrap{overflow-x:auto}
+@media (max-width:680px){
+  .flow{grid-template-columns:1fr 1fr}
+  .cards{grid-template-columns:1fr}
+  h1{font-size:22px}
+}
+</style>
+</head>
+<body>
+<main>
+<h1>SQL 助手：怎么用 MCP 接数据平台</h1>
+<div class="meta">经验总结 · 2026-11-17 · 基于 SQL 助手 2026-10-08 上线以来的实现与排障</div>
+
+<p class="lead"><b>一句话：</b>SQL 助手不连库、不存元数据，所有能力都通过 MCP 向 db-query 平台要。我们自己只写了一层「平台会话」，把平台公布的工具筛选、去掉身份参数后交给模型，调用时再由服务端补上身份。剩下的工作都是让这条链路在真实平台上稳定可用。</p>
+
+<h2>接法：四步走完一轮</h2>
+<div class="flow">
+  <div class="step"><i class="n">1</i><b>建连</b><span>官方 mcp SDK 的 SSE 客户端；account_hash_id 拼进地址圈定身份</span></div>
+  <div class="step"><i class="n">2</i><b>开轮取上下文</b><span>get_key_info 拿账号、项目、库类型；list_tools 拿工具声明，两者并发</span></div>
+  <div class="step key"><i class="n">3</i><b>改造成模型工具</b><span>白名单筛选、剔除身份参数，再加上自己合成的两个工具</span></div>
+  <div class="step"><i class="n">4</i><b>循环调用</b><span>模型调工具 → 服务端注入身份转发 → 结果回填，直到交卷过守门</span></div>
+</div>
+<p>代码位置：通道 <code>scripts/dbquery/channel.py</code>，身份链 <code>scripts/dbquery/identity.py</code>，平台会话 <code>scripts/agents/apps/sql_assistant/platform.py</code>，工具循环 <code>…/sql_assistant/agent.py</code>。</p>
+
+<h2>做对了的六件事</h2>
+<div class="cards">
+  <div class="card">
+    <h3>1. 工具声明直接用平台的</h3>
+    <p>参数 Schema 取自 <code>list_tools</code> 的 inputSchema，不在我们这边另写一份。</p>
+    <p class="why">公布的就是校验的；平台加参数、改说明，我们不用改代码。</p>
+  </div>
+  <div class="card">
+    <h3>2. 身份由服务端注入，模型看不见</h3>
+    <p><code>account_hash_id</code>、<code>key_index</code>、<code>question</code>、<code>model_name</code> 从声明里删掉，调用时再补上。</p>
+    <p class="why">模型无法冒用身份，权限永远等于提问人本人在平台上的权限，不用自建权限体系。</p>
+  </div>
+  <div class="card">
+    <h3>3. 白名单开放，执行通道不给模型</h3>
+    <p>只开放搜表、读结构、规范、EXPLAIN 校验；<code>submit_sql_query</code> 只留给服务端内部拼 SHOW CREATE TABLE。</p>
+    <p class="why">助手的边界由工具清单决定，不靠提示词约束。</p>
+  </div>
+  <div class="card">
+    <h3>4. 按账号能力动态挂工具</h3>
+    <p>数仓资产、指标、知识三项只在项目开通洞察时挂；一个账号挂多个项目时让模型选，但只放行名下的项目。</p>
+    <p class="why">模型看到的工具和真实可用的一致，少走冤枉路。</p>
+  </div>
+  <div class="card">
+    <h3>5. 在 MCP 之上合成自己的工具</h3>
+    <p><code>show_create_table</code>：平台没登记字段时读建表语句补结构。<code>submit_answer</code>：把「交付」也做成工具调用。</p>
+    <p class="why">交卷有了结构化入口，守门（只读、表已读、字段存在、EXPLAIN 通过）才有抓手。</p>
+  </div>
+  <div class="card">
+    <h3>6. 平台通道做成公共层</h3>
+    <p><code>scripts/dbquery/</code> 同时服务 SQL 助手和智能问数的 <code>user_query</code> 工具。</p>
+    <p class="why">建连、证书、重试、错误拆包修一次，两边同时受益。</p>
+  </div>
+</div>
+
+<h2>踩过的坑</h2>
+<div class="tablewrap">
+<table>
+<thead><tr><th style="width:34%">现象</th><th style="width:30%">原因</th><th>做法</th></tr></thead>
+<tbody>
+<tr><td>连接失败只报「unhandled errors in a TaskGroup」<br><span class="pit">08-31 预发联调</span></td><td>mcp/anyio 把真实异常裹进异常组</td><td><code>leaf_errors</code> 递归拆出叶子异常；业务异常先从组里找出来再判断</td></tr>
+<tr><td>https 端点 CERTIFICATE_VERIFY_FAILED</td><td>dbmanage 用自签证书</td><td>给 SDK 传自定义 httpx 工厂处理证书</td></tr>
+<tr><td>偶发 5xx、429、断连，整轮直接失败</td><td>平台侧抖动</td><td>建连重试一次，仍失败给用户「查询平台暂时连不上」</td></tr>
+<tr><td>搜表一直搜不到</td><td>参数是 <code>table_name</code> / <code>table_comment</code>，不存在 <code>keyword</code></td><td>以实测和 list_tools 为准，不凭文档猜参数</td></tr>
+<tr><td>全表扫描、占位符 SQL 也判「通过」</td><td>平台 validate_sql 只看能不能出执行计划</td><td>本地补一层事实检查；风险项作为「提示」随答复交付，不退回</td></tr>
+<tr><td>GLM 同一张表连读 14 次，步数耗尽<br><span class="pit">10-08 实测</span></td><td>模型会重复发相同的工具调用</td><td>同工具同参数直接拦下并回提示；超步数或超时进入收尾，只受理交卷</td></tr>
+<tr><td>某张表读失败，整轮报错</td><td>单次平台错误被当成致命错误</td><td>失败结果回给模型继续做；权限被拒时转为只按用户贴的 SQL 文本修复，附权限申请链接</td></tr>
+<tr><td>表在平台上没有字段元数据</td><td>平台登记不全</td><td>服务端走执行通道读 SHOW CREATE TABLE 补字段</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>可以带走的经验</h2>
+<ol class="take">
+  <li><b>MCP 服务端就是能力边界。</b>接入方要做的是「挑、藏、补」：挑出该开放的工具，藏起身份和危险通道，补上业务需要的合成工具。</li>
+  <li><b>身份永远不经过模型。</b>声明里删掉、调用时注入，这是用 MCP 做多用户服务最省心的权限方案。</li>
+  <li><b>让交付也走工具调用。</b>有了 <code>submit_answer</code>，程序才能在交付前检查，而不是在模型说完后补救。</li>
+  <li><b>MCP 调用失败要分级处理。</b>建连失败重试；单个工具失败回给模型；只有平台整体不可用才停下这一轮。</li>
+  <li><b>平台的「通过」不等于正确。</b>平台校验是必要条件，事实检查要自己补。</li>
+  <li><b>防打转的逻辑写在 MCP 调用层。</b>重复调用拦截、步数和时间预算，都在工具循环里统一处理。</li>
+</ol>
+</main>
+</body>
+</html>
